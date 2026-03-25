@@ -1,0 +1,4 @@
+td
+*.exe
+nimcache/
+.env
