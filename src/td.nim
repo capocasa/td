@@ -54,6 +54,15 @@ type
     isDateOnly*: bool
     tzid*: string
 
+  AlarmRing = enum
+    arOnce = "once"
+    arFiveTimes = "5x"
+    arNag = "nag"
+
+  Alarm = object
+    minutes*: int
+    ring*: AlarmRing
+
   RecurRule = object
     freq*: string  # DAILY, WEEKLY, MONTHLY, YEARLY
     interval*: int
@@ -69,7 +78,7 @@ type
     status*: TaskStatus
     categories*: seq[string]
     attachments*: seq[string]
-    alarms*: seq[int]  # minutes before due
+    alarms*: seq[Alarm]
     rrule*: Option[RecurRule]
     created*: Option[DateTime]
     lastModified*: Option[DateTime]
@@ -376,16 +385,18 @@ proc parseTask(filePath, calName: string): Option[Task] =
 
   # Separate VALARM blocks from properties
   var propLines: seq[string]
-  var alarmLines: seq[string]
+  var alarmBlocks: seq[seq[string]]
+  var currentAlarm: seq[string]
   var inAlarm = false
   for line in vtodoLines:
     if line.strip == "BEGIN:VALARM":
       inAlarm = true
-      alarmLines = @[]
+      currentAlarm = @[]
     elif line.strip == "END:VALARM":
       inAlarm = false
+      alarmBlocks.add(currentAlarm)
     elif inAlarm:
-      alarmLines.add(line)
+      currentAlarm.add(line)
     else:
       propLines.add(line)
 
@@ -442,10 +453,21 @@ proc parseTask(filePath, calName: string): Option[Task] =
       extraProps.add(line)
 
   # Parse alarms
-  for line in alarmLines:
-    let (name, params, value) = parsePropLine(line)
-    if name.toUpperAscii == "TRIGGER":
-      task.alarms.add(parseAlarmMinutes(value))
+  for alarmBlock in alarmBlocks:
+    var mins = 0
+    var repeatCount = 0
+    for line in alarmBlock:
+      let (name, params, value) = parsePropLine(line)
+      case name.toUpperAscii
+      of "TRIGGER": mins = parseAlarmMinutes(value)
+      of "REPEAT":
+        try: repeatCount = parseInt(value.strip)
+        except: discard
+      else: discard
+    let ring = if repeatCount >= 10: arNag
+               elif repeatCount >= 2: arFiveTimes
+               else: arOnce
+    task.alarms.add(Alarm(minutes: mins, ring: ring))
 
   task.extraProps = extraProps
   if task.uid.len == 0: return none(Task)
@@ -496,14 +518,22 @@ proc toIcs(task: Task): string =
   for prop in task.extraProps:
     lines.add(foldLine(prop))
 
-  for mins in task.alarms:
+  for alarm in task.alarms:
     lines.add("BEGIN:VALARM")
-    if mins > 0:
-      lines.add("TRIGGER:-PT" & $mins & "M")
+    if alarm.minutes > 0:
+      lines.add("TRIGGER:-PT" & $alarm.minutes & "M")
     else:
       lines.add("TRIGGER:PT0S")
     lines.add("ACTION:DISPLAY")
     lines.add(foldLine("DESCRIPTION:" & escapeIcsText(task.summary)))
+    case alarm.ring
+    of arFiveTimes:
+      lines.add("REPEAT:4")
+      lines.add("DURATION:PT5M")
+    of arNag:
+      lines.add("REPEAT:60")
+      lines.add("DURATION:PT1M")
+    of arOnce: discard
     lines.add("END:VALARM")
 
   lines.add("END:VTODO")
@@ -881,7 +911,12 @@ proc displayDetail(task: Task) =
     for att in task.attachments:
       echo "  Attach:    " & att
   if task.alarms.len > 0:
-    echo "  Alarms:    " & task.alarms.mapIt($it & "m before").join(", ")
+    echo "  Alarms:    " & task.alarms.mapIt(
+      $it.minutes & "m before" & (case it.ring
+        of arOnce: ""
+        of arFiveTimes: " (5x)"
+        of arNag: " (nag)")
+    ).join(", ")
   if task.created.isSome:
     echo "  Created:   " & task.created.get.local.format("yyyy-MM-dd HH:mm")
   if task.lastModified.isSome:
@@ -903,7 +938,7 @@ type
     hasAttachments: bool
     detach: seq[string]
     hasDetach: bool
-    alarms: seq[int]
+    alarms: seq[Alarm]
     hasAlarms: bool
     every: string
     hasEvery: bool
@@ -955,8 +990,19 @@ proc handleOptValue(opts: var ParsedOpts, field, value: string) =
     if value == "":
       opts.alarms = @[]
     else:
-      try: opts.alarms.add(parseInt(value))
+      # Parse: "15" (once), "15:5x" (5 times), "15:nag" (persistent)
+      let parts = value.split(':', 1)
+      var mins: int
+      try: mins = parseInt(parts[0])
       except ValueError: quit("Invalid alarm minutes: " & value, 1)
+      var ring = arOnce
+      if parts.len == 2:
+        case parts[1].toLowerAscii
+        of "5x", "5": ring = arFiveTimes
+        of "nag", "persistent", "always": ring = arNag
+        of "once", "1", "1x": ring = arOnce
+        else: quit("Invalid alarm ring mode: " & parts[1] & ". Use once, 5x, or nag", 1)
+      opts.alarms.add(Alarm(minutes: mins, ring: ring))
   of "every":
     opts.hasEvery = true
     opts.every = value
@@ -1389,7 +1435,7 @@ Add/Edit options:
   -t, --tag TAG         Category (repeatable)
   -f, --attach FILE     File attachment (repeatable, additive on edit)
   -F, --detach NAME     Remove attachment matching NAME (or "" for all)
-  -a, --alarm MIN       Alarm N minutes before due (repeatable)
+  -a, --alarm MIN[:MODE] Alarm N min before due (repeatable; mode: once, 5x, nag)
   --every INTERVAL      Recurrence (1d, 2w, 1m, 1y, daily, weekly, monthly, yearly)
   --on DAYS             Weekdays for weekly recurrence (mo,we,fr)
   -c, --calendar CAL    Calendar name

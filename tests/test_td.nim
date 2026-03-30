@@ -153,13 +153,11 @@ suite "add command":
     let (output, _) = env.run("show", $id)
     check "15m before" in output
 
-  test "add with multiple alarms writes multiple valarms":
+  test "add with multiple alarms":
     let id = env.addTask("Multi alarm", "-a", "5", "-a", "30")
-    let content = readFile(env.icsFiles()[0])
-    # Both alarms are written to ICS
-    check "TRIGGER:-PT5M" in content
-    check "TRIGGER:-PT30M" in content
-    # Note: parser bug only reads last VALARM block, so show only displays 30m
+    let (output, _) = env.run("show", $id)
+    check "5m before" in output
+    check "30m before" in output
 
   test "add with recurrence daily":
     let id = env.addTask("Daily", "--every", "daily", "-d", "today")
@@ -1020,6 +1018,105 @@ suite "recurrence":
     # Should be 7 days from today
     let expected = (now() + 7.days).format("yyyy-MM-dd")
     check expected in output
+
+suite "alarm ring modes":
+  var env: TestEnv
+
+  setup:
+    env = setup()
+  teardown:
+    env.teardown()
+
+  test "alarm defaults to once":
+    let id = env.addTask("Once", "-a", "15")
+    let (output, _) = env.run("show", $id)
+    check "15m before" in output
+    check "(5x)" notin output
+    check "(nag)" notin output
+    let content = readFile(env.icsFiles()[0])
+    check "REPEAT" notin content
+
+  test "alarm 5x mode":
+    let id = env.addTask("Five", "-a", "15:5x")
+    let (output, _) = env.run("show", $id)
+    check "15m before (5x)" in output
+    let content = readFile(env.icsFiles()[0])
+    check "REPEAT:4" in content
+    check "DURATION:PT5M" in content
+
+  test "alarm nag mode":
+    let id = env.addTask("Nag", "-a", "10:nag")
+    let (output, _) = env.run("show", $id)
+    check "10m before (nag)" in output
+    let content = readFile(env.icsFiles()[0])
+    check "REPEAT:60" in content
+    check "DURATION:PT1M" in content
+
+  test "alarm 5x shortcut with just 5":
+    let id = env.addTask("Short", "-a", "15:5")
+    let (output, _) = env.run("show", $id)
+    check "15m before (5x)" in output
+
+  test "alarm persistent alias":
+    let id = env.addTask("Persist", "-a", "15:persistent")
+    let (output, _) = env.run("show", $id)
+    check "15m before (nag)" in output
+
+  test "alarm always alias":
+    let id = env.addTask("Always", "-a", "15:always")
+    let (output, _) = env.run("show", $id)
+    check "15m before (nag)" in output
+
+  test "alarm once explicit":
+    let id = env.addTask("Explicit", "-a", "15:once")
+    let (output, _) = env.run("show", $id)
+    check "15m before" in output
+    check "(5x)" notin output
+
+  test "multiple alarms mixed modes":
+    let id = env.addTask("Mixed", "-a", "5", "-a", "15:5x", "-a", "30:nag")
+    let (output, _) = env.run("show", $id)
+    check "5m before" in output
+    check "15m before (5x)" in output
+    check "30m before (nag)" in output
+
+  test "invalid ring mode fails":
+    let (_, code) = env.run("add", "Bad", "-a", "15:bogus")
+    check code != 0
+
+  test "edit alarm with ring mode":
+    let id = env.addTask("Task")
+    discard env.run("edit", $id, "-a", "10:nag")
+    let (output, _) = env.run("show", $id)
+    check "10m before (nag)" in output
+
+  test "round-trip preserves ring mode":
+    let id = env.addTask("RT", "-a", "20:5x")
+    # Edit something else, alarm should be preserved
+    discard env.run("edit", $id, "-p", "high")
+    let (output, _) = env.run("show", $id)
+    check "20m before (5x)" in output
+
+  test "ics round-trip reads repeat":
+    # Write ICS with REPEAT/DURATION manually
+    let uid = "test-alarm-ring-uid"
+    let ics = "BEGIN:VCALENDAR\nVERSION:2.0\nPRODID:test\nBEGIN:VTODO\nDTSTAMP:20260101T000000Z\nUID:" & uid & "\nSUMMARY:Ext alarm\nSTATUS:NEEDS-ACTION\nBEGIN:VALARM\nTRIGGER:-PT25M\nACTION:DISPLAY\nDESCRIPTION:Ext alarm\nREPEAT:4\nDURATION:PT5M\nEND:VALARM\nEND:VTODO\nEND:VCALENDAR\n"
+    writeFile(env.calDir / uid & ".ics", ics)
+    let (findOut, _) = env.run("find", "Ext alarm")
+    let line = findOut.splitLines[0].strip
+    let id = line.split(" ")[0].strip
+    let (output, _) = env.run("show", id)
+    check "25m before (5x)" in output
+
+  test "ics round-trip reads nag repeat":
+    let uid = "test-alarm-nag-uid"
+    let ics = "BEGIN:VCALENDAR\nVERSION:2.0\nPRODID:test\nBEGIN:VTODO\nDTSTAMP:20260101T000000Z\nUID:" & uid & "\nSUMMARY:Nag alarm\nSTATUS:NEEDS-ACTION\nBEGIN:VALARM\nTRIGGER:-PT5M\nACTION:DISPLAY\nDESCRIPTION:Nag alarm\nREPEAT:60\nDURATION:PT1M\nEND:VALARM\nEND:VTODO\nEND:VCALENDAR\n"
+    writeFile(env.calDir / uid & ".ics", ics)
+    let (findOut, _) = env.run("find", "Nag alarm")
+    let line = findOut.splitLines[0].strip
+    let id = line.split(" ")[0].strip
+    let (output, _) = env.run("show", id)
+    check "5m before (nag)" in output
 
 suite "edge cases":
   var env: TestEnv
