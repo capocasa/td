@@ -63,6 +63,7 @@ type
     priority*: int
     status*: TaskStatus
     categories*: seq[string]
+    attachments*: seq[string]
     alarms*: seq[int]  # minutes before due
     created*: Option[DateTime]
     lastModified*: Option[DateTime]
@@ -331,6 +332,8 @@ proc parseTask(filePath, calName: string): Option[Task] =
       try: task.priority = parseInt(value.strip)
       except: discard
     of "STATUS": task.status = parseStatus(value)
+    of "ATTACH":
+      if value.strip.len > 0: task.attachments.add(value.strip)
     of "CATEGORIES":
       for cat in value.split(","):
         let c = cat.strip
@@ -394,6 +397,8 @@ proc toIcs(task: Task): string =
   if task.priority > 0:
     lines.add("PRIORITY:" & $task.priority)
   lines.add("STATUS:" & $task.status)
+  for att in task.attachments:
+    lines.add(foldLine("ATTACH:" & att))
   if task.categories.len > 0:
     lines.add(foldLine("CATEGORIES:" & task.categories.join(",")))
   if task.percentComplete > 0:
@@ -501,7 +506,45 @@ proc parseDateInput(s: string): DueDate =
       d = d + 1.days
     DueDate(dt: d, isDateOnly: true)
 
-  case s.toLowerAscii
+  proc withTime(base: DateTime, hour: int, minute: int = 0): DueDate =
+    let dt = dateTime(base.year, base.month, base.monthday, hour, minute, zone = local())
+    DueDate(dt: dt.utc, isDateOnly: false, tzid: "UTC")
+
+  proc resolveTimeWord(word: string, base: DateTime): DueDate =
+    case word
+    of "morning": return withTime(base, 9)
+    of "noon": return withTime(base, 12)
+    of "afternoon": return withTime(base, 14)
+    of "evening": return withTime(base, 18)
+    of "tonight": return withTime(base, 21)
+    of "midnight": return withTime(base + 1.days, 0)
+    of "eod": return withTime(base, 17)
+    else: quit("Invalid time word: " & word, 1)
+
+  let lower = s.toLowerAscii.strip
+  let parts = lower.split(' ', 1)
+
+  # Two-word forms: "tomorrow morning", "monday noon", etc.
+  if parts.len == 2:
+    let timeWord = parts[1].strip
+    if timeWord in ["morning", "noon", "afternoon", "evening", "tonight", "midnight", "eod"]:
+      let dayPart = parts[0].strip
+      var base: DateTime
+      case dayPart
+      of "today": base = todayDate
+      of "tomorrow": base = todayDate + 1.days
+      of "yesterday": base = todayDate - 1.days
+      of "monday", "mon": base = nextWeekday(dMon).dt
+      of "tuesday", "tue": base = nextWeekday(dTue).dt
+      of "wednesday", "wed": base = nextWeekday(dWed).dt
+      of "thursday", "thu": base = nextWeekday(dThu).dt
+      of "friday", "fri": base = nextWeekday(dFri).dt
+      of "saturday", "sat": base = nextWeekday(dSat).dt
+      of "sunday", "sun": base = nextWeekday(dSun).dt
+      else: quit("Invalid date: " & s, 1)
+      return resolveTimeWord(timeWord, base)
+
+  case lower
   of "today": return DueDate(dt: todayDate, isDateOnly: true)
   of "tomorrow": return DueDate(dt: todayDate + 1.days, isDateOnly: true)
   of "yesterday": return DueDate(dt: todayDate - 1.days, isDateOnly: true)
@@ -512,24 +555,45 @@ proc parseDateInput(s: string): DueDate =
   of "friday", "fri": return nextWeekday(dFri)
   of "saturday", "sat": return nextWeekday(dSat)
   of "sunday", "sun": return nextWeekday(dSun)
+  of "morning": return resolveTimeWord("morning", todayDate)
+  of "noon": return resolveTimeWord("noon", todayDate)
+  of "afternoon": return resolveTimeWord("afternoon", todayDate)
+  of "evening": return resolveTimeWord("evening", todayDate)
+  of "tonight": return resolveTimeWord("tonight", todayDate)
+  of "midnight": return resolveTimeWord("midnight", todayDate)
+  of "eod": return resolveTimeWord("eod", todayDate)
   else: discard
 
-  # Relative: +3d, -1w, +2m
-  if s.len >= 2 and s[0] in {'+', '-'}:
-    let sign = if s[0] == '+': 1 else: -1
-    let unit = s[^1]
-    let numStr = s[1 ..^ 2]
-    try:
-      let n = parseInt(numStr)
-      case unit
-      of 'd': return DueDate(dt: todayDate + (n * sign).days, isDateOnly: true)
-      of 'w': return DueDate(dt: todayDate + (n * sign * 7).days, isDateOnly: true)
-      of 'm': return DueDate(dt: todayDate + (n * sign).months, isDateOnly: true)
-      else: discard
-    except ValueError: discard
+  # Relative: +3d, -1w, +2m, +1h, +30min, +90s
+  if lower.len >= 2 and lower[0] in {'+', '-'}:
+    let sign = if lower[0] == '+': 1 else: -1
+    let tail = lower[1 .. ^1]
+    # Find where digits end
+    var i = 0
+    while i < tail.len and tail[i] in {'0'..'9'}: inc i
+    if i > 0 and i < tail.len:
+      let numStr = tail[0 ..< i]
+      let unit = tail[i .. ^1]
+      try:
+        let n = parseInt(numStr)
+        case unit
+        of "d": return DueDate(dt: todayDate + (n * sign).days, isDateOnly: true)
+        of "w": return DueDate(dt: todayDate + (n * sign * 7).days, isDateOnly: true)
+        of "m": return DueDate(dt: todayDate + (n * sign).months, isDateOnly: true)
+        of "h":
+          let dt = (today + (n * sign).hours).utc
+          return DueDate(dt: dt, isDateOnly: false, tzid: "UTC")
+        of "min":
+          let dt = (today + (n * sign).minutes).utc
+          return DueDate(dt: dt, isDateOnly: false, tzid: "UTC")
+        of "s":
+          let dt = (today + (n * sign).seconds).utc
+          return DueDate(dt: dt, isDateOnly: false, tzid: "UTC")
+        else: discard
+      except ValueError: discard
 
   # Absolute: 2026-04-01 or 20260401
-  let cleaned = s.replace("-", "")
+  let cleaned = lower.replace("-", "")
   try:
     return DueDate(dt: parse(cleaned, "yyyyMMdd"), isDateOnly: true)
   except:
@@ -589,34 +653,42 @@ proc loadAllTasks(): seq[Task] =
 proc dueLabel(d: DueDate): string =
   let today = now()
   let todayTuple = (today.year, today.month.ord, today.monthday)
-  let dueTuple = (d.dt.year, d.dt.month.ord, d.dt.monthday)
-  if dueTuple == todayTuple: return "today"
+  let localDt = if d.isDateOnly: d.dt else: d.dt.local
+  let dueTuple = (localDt.year, localDt.month.ord, localDt.monthday)
+  let timeSuffix = if d.isDateOnly: "" else: " " & localDt.format("HH:mm")
+  if dueTuple == todayTuple: return "today" & timeSuffix
   let tom = today + 1.days
   let tomTuple = (tom.year, tom.month.ord, tom.monthday)
-  if dueTuple == tomTuple: return "tomorrow"
+  if dueTuple == tomTuple: return "tomorrow" & timeSuffix
   let yest = today - 1.days
   let yestTuple = (yest.year, yest.month.ord, yest.monthday)
-  if dueTuple == yestTuple: return "yesterday"
-  d.dt.format("yyyy-MM-dd")
+  if dueTuple == yestTuple: return "yesterday" & timeSuffix
+  localDt.format("yyyy-MM-dd") & timeSuffix
 
 proc dueLabelColored(d: DueDate): string =
   let today = now()
   let todayTuple = (today.year, today.month.ord, today.monthday)
-  let dueTuple = (d.dt.year, d.dt.month.ord, d.dt.monthday)
-  if dueTuple == todayTuple: return bold("today")
+  let localDt = if d.isDateOnly: d.dt else: d.dt.local
+  let dueTuple = (localDt.year, localDt.month.ord, localDt.monthday)
+  let timeSuffix = if d.isDateOnly: "" else: " " & localDt.format("HH:mm")
+  if dueTuple == todayTuple: return bold("today" & timeSuffix)
   let tom = today + 1.days
-  if (tom.year, tom.month.ord, tom.monthday) == dueTuple: return "tomorrow"
+  if (tom.year, tom.month.ord, tom.monthday) == dueTuple: return "tomorrow" & timeSuffix
   if dueTuple < todayTuple: return red(dueLabel(d))
   dueLabel(d)
 
 proc isOverdue(d: DueDate): bool =
   let today = now()
-  (d.dt.year, d.dt.month.ord, d.dt.monthday) <
-    (today.year, today.month.ord, today.monthday)
+  if d.isDateOnly:
+    (d.dt.year, d.dt.month.ord, d.dt.monthday) <
+      (today.year, today.month.ord, today.monthday)
+  else:
+    d.dt.toTime < today.toTime
 
 proc isDueToday(d: DueDate): bool =
   let today = now()
-  (d.dt.year, d.dt.month.ord, d.dt.monthday) ==
+  let localDt = if d.isDateOnly: d.dt else: d.dt.local
+  (localDt.year, localDt.month.ord, localDt.monthday) ==
     (today.year, today.month.ord, today.monthday)
 
 proc sortDue(d: Option[DueDate]): int64 =
@@ -629,7 +701,7 @@ proc displayList(tasks: seq[Task]) =
 
   let maxIdWidth = max(2, tasks.mapIt(($it.id).len).max)
   let maxCalWidth = max(3, tasks.mapIt(it.calendarName.len).max)
-  let dueWidth = 10
+  let dueWidth = 16
   let prioWidth = 3
   let tw = try: terminalWidth() except: 80
   let summaryWidth = max(10, tw - maxIdWidth - 1 - prioWidth - 1 - dueWidth - 1 - maxCalWidth - 1)
@@ -665,11 +737,14 @@ proc displayDetail(task: Task) =
   if task.due.isSome:
     let d = task.due.get
     let label = if useColor: dueLabelColored(d) else: dueLabel(d)
-    echo "  Due:       " & label & (if d.isDateOnly: "" else: " " & d.dt.format("HH:mm"))
+    echo "  Due:       " & label
   if task.description.len > 0:
-    echo "  Note:      " & task.description.replace("\n", "\n             ")
+    echo "  Desc:      " & task.description.replace("\n", "\n             ")
   if task.categories.len > 0:
     echo "  Tags:      " & task.categories.join(", ")
+  if task.attachments.len > 0:
+    for att in task.attachments:
+      echo "  Attach:    " & att
   if task.alarms.len > 0:
     echo "  Alarms:    " & task.alarms.mapIt($it & "m before").join(", ")
   if task.created.isSome:
@@ -685,10 +760,14 @@ type
     hasDue: bool
     priority: int
     hasPriority: bool
-    note: string
-    hasNote: bool
+    description: string
+    hasDescription: bool
     tags: seq[string]
     hasTags: bool
+    attachments: seq[string]
+    hasAttachments: bool
+    detach: seq[string]
+    hasDetach: bool
     alarms: seq[int]
     hasAlarms: bool
     calName: string
@@ -712,8 +791,20 @@ proc handleOptValue(opts: var ParsedOpts, field, value: string) =
     opts.hasPriority = true
     opts.priority = parsePriority(value)
   of "n":
-    opts.hasNote = true
-    opts.note = value
+    opts.hasDescription = true
+    opts.description = value
+  of "f":
+    opts.hasAttachments = true
+    if value == "":
+      opts.attachments = @[]
+    else:
+      opts.attachments.add(value)
+  of "detach":
+    opts.hasDetach = true
+    if value == "":
+      opts.detach = @[]
+    else:
+      opts.detach.add(value)
   of "t":
     opts.hasTags = true
     if value == "":
@@ -737,13 +828,31 @@ proc handleOptValue(opts: var ParsedOpts, field, value: string) =
 proc parseOpts(args: seq[string], isListCmd: bool = false): ParsedOpts =
   var opts = ParsedOpts(sortField: "default")
   var expectVal = ""
+  var negAccum = "" # Accumulates chars for negative values like -1w, -15min
+  if args.len == 0:
+    return opts
   var p = initOptParser(args)
   for kind, key, val in p.getopt():
+    if negAccum != "":
+      if kind == cmdShortOption and val == "":
+        negAccum &= key
+        continue
+      elif kind == cmdShortOption:
+        negAccum &= key & val
+        handleOptValue(opts, expectVal, negAccum)
+        expectVal = ""
+        negAccum = ""
+        continue
+      else:
+        handleOptValue(opts, expectVal, negAccum)
+        expectVal = ""
+        negAccum = ""
+        # Fall through to process current token
+
     if expectVal != "":
       if kind == cmdShortOption and key.len > 0 and key[0].isDigit:
-        # Negative value like -1w
-        handleOptValue(opts, expectVal, "-" & key & val)
-        expectVal = ""
+        # Start of negative value like -1w or -15min
+        negAccum = "-" & key & val
         continue
       elif kind in {cmdArgument, cmdEnd}:
         handleOptValue(opts, expectVal, key)
@@ -760,22 +869,26 @@ proc parseOpts(args: seq[string], isListCmd: bool = false): ParsedOpts =
         case key
         of "d", "due": handleOptValue(opts, "d", val)
         of "p", "priority", "prio": handleOptValue(opts, "p", val)
-        of "n", "note": handleOptValue(opts, "n", val)
+        of "n", "description", "desc": handleOptValue(opts, "n", val)
         of "t", "tag": handleOptValue(opts, "t", val)
+        of "f", "attach", "attachment": handleOptValue(opts, "f", val)
+        of "F", "detach": handleOptValue(opts, "detach", val)
         of "a":
           if isListCmd: opts.showAll = true
           else: handleOptValue(opts, "a-alarm", val)
         of "alarm": handleOptValue(opts, "a-alarm", val)
         of "c", "cal", "calendar": handleOptValue(opts, "c", val)
         of "s", "sort": handleOptValue(opts, "s", val)
-        of "done": opts.showDone = true
+        of "D", "done": opts.showDone = true
         else: quit("Unknown option: " & key, 1)
       else:
         case key
         of "d", "due": expectVal = "d"
         of "p", "priority", "prio": expectVal = "p"
-        of "n", "note": expectVal = "n"
+        of "n", "description", "desc": expectVal = "n"
         of "t", "tag": expectVal = "t"
+        of "f", "attach", "attachment": expectVal = "f"
+        of "F", "detach": expectVal = "detach"
         of "a":
           if isListCmd: opts.showAll = true
           else: expectVal = "a-alarm"
@@ -783,12 +896,15 @@ proc parseOpts(args: seq[string], isListCmd: bool = false): ParsedOpts =
         of "c", "cal", "calendar": expectVal = "c"
         of "s", "sort": expectVal = "s"
         of "all": opts.showAll = true
-        of "done": opts.showDone = true
+        of "D", "done": opts.showDone = true
         else: quit("Unknown option: " & key, 1)
     of cmdArgument:
       opts.args.add(key)
     of cmdEnd: break
 
+  if negAccum != "":
+    handleOptValue(opts, expectVal, negAccum)
+    expectVal = ""
   if expectVal != "":
     quit("Missing value for option", 1)
   opts
@@ -809,11 +925,12 @@ proc cmdAdd(args: seq[string]) =
   var task = Task(
     uid: uid,
     summary: summary,
-    description: if opts.hasNote: opts.note else: "",
+    description: if opts.hasDescription: opts.description else: "",
     due: opts.due,
     priority: if opts.hasPriority: opts.priority else: 0,
     status: tsNeedsAction,
     categories: opts.tags,
+    attachments: opts.attachments,
     alarms: opts.alarms,
     calendarName: calName,
     filePath: filePath,
@@ -850,9 +967,21 @@ proc cmdEdit(args: seq[string]) =
 
   # Apply only explicitly set fields
   if opts.hasDue: task.due = opts.due
-  if opts.hasNote: task.description = opts.note
+  if opts.hasDescription: task.description = opts.description
   if opts.hasPriority: task.priority = opts.priority
   if opts.hasTags: task.categories = opts.tags
+  if opts.hasDetach:
+    if opts.detach.len == 0:
+      task.attachments = @[]
+    else:
+      for pat in opts.detach:
+        task.attachments = task.attachments.filterIt(not it.contains(pat))
+  if opts.hasAttachments:
+    if opts.attachments.len == 0:
+      task.attachments = @[]
+    else:
+      for att in opts.attachments:
+        task.attachments.add(att)
   if opts.hasAlarms: task.alarms = opts.alarms
 
   # Update summary if positional arg given
@@ -1071,10 +1200,10 @@ Usage:
   td [command] [options]
 
 Commands:
-  add, new              Add a new task
+  add, new, create      Add a new task
   edit, mod, modify     Edit an existing task
   list, ls              List tasks (default)
-  done, do              Mark task(s) as completed
+  done, did             Mark task(s) as completed
   cancel                Cancel task(s)
   find, search          Full text search across all tasks
   delete, del, rm       Delete task(s) (moves to trash)
@@ -1083,8 +1212,10 @@ Commands:
 Add/Edit options:
   -d, --due DATE        Due date (today, tomorrow, +3d, +1w, 2026-04-01)
   -p, --priority P      Priority (high, medium, low, none)
-  -n, --note TEXT       Description/notes
+  -n, --description T   Description text
   -t, --tag TAG         Category (repeatable)
+  -f, --attach FILE     File attachment (repeatable, additive on edit)
+  -F, --detach NAME     Remove attachment matching NAME (or "" for all)
   -a, --alarm MIN       Alarm N minutes before due (repeatable)
   -c, --calendar CAL    Calendar name
 
@@ -1095,7 +1226,7 @@ List options:
   -c, --calendar CAL    Filter: calendar name
   -t, --tag TAG         Filter: category
   -s, --sort FIELD      Sort by: due/d, prio/p, created/c
-  --done                Show completed/cancelled tasks
+  -D, --done            Show completed/cancelled tasks
 
 Edit: use empty string to clear a field (e.g., -d "" clears due date)
 
@@ -1129,10 +1260,10 @@ proc main() =
   if params.len > 0:
     let first = params[0]
     case first
-    of "add", "new": subcmd = "add"; cmdArgs = params[1 ..^ 1]
+    of "add", "new", "create": subcmd = "add"; cmdArgs = params[1 ..^ 1]
     of "edit", "mod", "modify": subcmd = "edit"; cmdArgs = params[1 ..^ 1]
     of "list", "ls": subcmd = "list"; cmdArgs = params[1 ..^ 1]
-    of "done", "do": subcmd = "done"; cmdArgs = params[1 ..^ 1]
+    of "done", "did": subcmd = "done"; cmdArgs = params[1 ..^ 1]
     of "cancel": subcmd = "cancel"; cmdArgs = params[1 ..^ 1]
     of "find", "search": subcmd = "find"; cmdArgs = params[1 ..^ 1]
     of "delete", "del", "rm", "remove": subcmd = "delete"; cmdArgs = params[1 ..^ 1]
