@@ -54,6 +54,11 @@ type
     isDateOnly*: bool
     tzid*: string
 
+  RecurRule = object
+    freq*: string  # DAILY, WEEKLY, MONTHLY, YEARLY
+    interval*: int
+    byDay*: seq[string]  # MO, TU, WE, TH, FR, SA, SU
+
   Task = object
     id*: int
     uid*: string
@@ -65,6 +70,7 @@ type
     categories*: seq[string]
     attachments*: seq[string]
     alarms*: seq[int]  # minutes before due
+    rrule*: Option[RecurRule]
     created*: Option[DateTime]
     lastModified*: Option[DateTime]
     completed*: Option[DateTime]
@@ -258,6 +264,80 @@ proc parseAlarmMinutes(value: string): int =
       else: discard
   if negative: minutes else: 0
 
+# --- RRULE Parsing ---
+
+proc parseRrule(value: string): RecurRule =
+  var rule = RecurRule(interval: 1)
+  for part in value.split(';'):
+    let kv = part.split('=', 1)
+    if kv.len == 2:
+      case kv[0].toUpperAscii
+      of "FREQ": rule.freq = kv[1].toUpperAscii
+      of "INTERVAL":
+        try: rule.interval = parseInt(kv[1])
+        except: discard
+      of "BYDAY":
+        for d in kv[1].split(','):
+          rule.byDay.add(d.strip.toUpperAscii)
+      else: discard
+  rule
+
+proc formatRrule(rule: RecurRule): string =
+  result = "RRULE:FREQ=" & rule.freq
+  if rule.interval > 1:
+    result &= ";INTERVAL=" & $rule.interval
+  if rule.byDay.len > 0:
+    result &= ";BYDAY=" & rule.byDay.join(",")
+
+proc rruleLabel(rule: RecurRule): string =
+  let n = rule.interval
+  case rule.freq
+  of "DAILY":
+    if n == 1: result = "every day"
+    else: result = "every " & $n & " days"
+  of "WEEKLY":
+    if rule.byDay.len > 0:
+      result = "every "
+      if n > 1: result &= $n & " "
+      result &= "week on " & rule.byDay.join(",")
+    elif n == 1: result = "every week"
+    else: result = "every " & $n & " weeks"
+  of "MONTHLY":
+    if n == 1: result = "every month"
+    else: result = "every " & $n & " months"
+  of "YEARLY":
+    if n == 1: result = "every year"
+    else: result = "every " & $n & " years"
+  else: result = rule.freq
+
+proc nextOccurrence(due: DueDate, rule: RecurRule): DueDate =
+  var next = due
+  case rule.freq
+  of "DAILY":
+    next.dt = due.dt + (rule.interval).days
+  of "WEEKLY":
+    if rule.byDay.len > 0:
+      # Find next matching weekday
+      let dayMap = {"MO": dMon, "TU": dTue, "WE": dWed, "TH": dThu,
+                    "FR": dFri, "SA": dSat, "SU": dSun}.toTable
+      var days: seq[WeekDay]
+      for d in rule.byDay:
+        if d in dayMap: days.add(dayMap[d])
+      if days.len > 0:
+        var candidate = due.dt + 1.days
+        for _ in 0 ..< rule.interval * 7:
+          if candidate.weekday in days:
+            next.dt = candidate
+            return next
+          candidate = candidate + 1.days
+    next.dt = due.dt + (rule.interval * 7).days
+  of "MONTHLY":
+    next.dt = due.dt + rule.interval.months
+  of "YEARLY":
+    next.dt = due.dt + (rule.interval * 12).months
+  else: discard
+  next
+
 proc parseStatus(s: string): TaskStatus =
   case s.strip.toUpperAscii
   of "NEEDS-ACTION": tsNeedsAction
@@ -334,6 +414,8 @@ proc parseTask(filePath, calName: string): Option[Task] =
     of "STATUS": task.status = parseStatus(value)
     of "ATTACH":
       if value.strip.len > 0: task.attachments.add(value.strip)
+    of "RRULE":
+      task.rrule = some(parseRrule(value))
     of "CATEGORIES":
       for cat in value.split(","):
         let c = cat.strip
@@ -397,6 +479,8 @@ proc toIcs(task: Task): string =
   if task.priority > 0:
     lines.add("PRIORITY:" & $task.priority)
   lines.add("STATUS:" & $task.status)
+  if task.rrule.isSome:
+    lines.add(formatRrule(task.rrule.get))
   for att in task.attachments:
     lines.add(foldLine("ATTACH:" & att))
   if task.categories.len > 0:
@@ -613,6 +697,54 @@ proc parsePriority(s: string): int =
     except ValueError:
       quit("Invalid priority: " & s, 1)
 
+proc parseEveryInput(s: string, onDays: string = ""): Option[RecurRule] =
+  if s == "":
+    return none(RecurRule)
+  let lower = s.toLowerAscii.strip
+  var rule = RecurRule(interval: 1)
+
+  # Word forms
+  case lower
+  of "day", "daily": rule.freq = "DAILY"
+  of "week", "weekly": rule.freq = "WEEKLY"
+  of "month", "monthly": rule.freq = "MONTHLY"
+  of "year", "yearly": rule.freq = "YEARLY"
+  else:
+    # Numeric forms: 3d, 2w, 1m, 1y
+    if lower.len >= 2:
+      var i = 0
+      while i < lower.len and lower[i] in {'0'..'9'}: inc i
+      if i > 0 and i < lower.len:
+        let n = parseInt(lower[0 ..< i])
+        let unit = lower[i .. ^1]
+        case unit
+        of "d": rule.freq = "DAILY"; rule.interval = n
+        of "w": rule.freq = "WEEKLY"; rule.interval = n
+        of "m": rule.freq = "MONTHLY"; rule.interval = n
+        of "y": rule.freq = "YEARLY"; rule.interval = n
+        else: quit("Invalid recurrence: " & s, 1)
+      else:
+        quit("Invalid recurrence: " & s, 1)
+    else:
+      quit("Invalid recurrence: " & s, 1)
+
+  # Parse --on days
+  if onDays != "":
+    if rule.freq != "WEEKLY":
+      quit("--on can only be used with weekly recurrence", 1)
+    let dayMap = {"mo": "MO", "tu": "TU", "we": "WE", "th": "TH",
+                  "fr": "FR", "sa": "SA", "su": "SU",
+                  "mon": "MO", "tue": "TU", "wed": "WE", "thu": "TH",
+                  "fri": "FR", "sat": "SA", "sun": "SU"}.toTable
+    for d in onDays.toLowerAscii.split(','):
+      let ds = d.strip
+      if ds in dayMap:
+        rule.byDay.add(dayMap[ds])
+      else:
+        quit("Invalid day: " & ds & ". Use mo,tu,we,th,fr,sa,su", 1)
+
+  some(rule)
+
 # --- Task Loading ---
 
 proc defaultCalendarName(): string =
@@ -720,11 +852,12 @@ proc displayList(tasks: seq[Task]) =
     let summStr = alignLeft(summ, summaryWidth)
     let calStr = t.calendarName
 
+    let recurMark = if t.rrule.isSome: "~ " else: "  "
     let statusMark = case t.status
       of tsCompleted: dim("[x] ")
       of tsCancelled: dim("[-] ")
       of tsInProcess: "[>] "
-      else: "    "
+      else: recurMark & "  "
 
     echo idStr & " " & prioStr & " " & dueStr & " " & statusMark & summStr & " " & calStr
 
@@ -738,6 +871,8 @@ proc displayDetail(task: Task) =
     let d = task.due.get
     let label = if useColor: dueLabelColored(d) else: dueLabel(d)
     echo "  Due:       " & label
+  if task.rrule.isSome:
+    echo "  Recur:     " & rruleLabel(task.rrule.get)
   if task.description.len > 0:
     echo "  Desc:      " & task.description.replace("\n", "\n             ")
   if task.categories.len > 0:
@@ -770,6 +905,10 @@ type
     hasDetach: bool
     alarms: seq[int]
     hasAlarms: bool
+    every: string
+    hasEvery: bool
+    onDays: string
+    hasOnDays: bool
     calName: string
     hasCal: bool
     # list-specific
@@ -818,6 +957,12 @@ proc handleOptValue(opts: var ParsedOpts, field, value: string) =
     else:
       try: opts.alarms.add(parseInt(value))
       except ValueError: quit("Invalid alarm minutes: " & value, 1)
+  of "every":
+    opts.hasEvery = true
+    opts.every = value
+  of "on":
+    opts.hasOnDays = true
+    opts.onDays = value
   of "c":
     opts.hasCal = true
     opts.calName = value
@@ -877,6 +1022,8 @@ proc parseOpts(args: seq[string], isListCmd: bool = false): ParsedOpts =
           if isListCmd: opts.showAll = true
           else: handleOptValue(opts, "a-alarm", val)
         of "alarm": handleOptValue(opts, "a-alarm", val)
+        of "every": handleOptValue(opts, "every", val)
+        of "on": handleOptValue(opts, "on", val)
         of "c", "cal", "calendar": handleOptValue(opts, "c", val)
         of "s", "sort": handleOptValue(opts, "s", val)
         of "D", "done": opts.showDone = true
@@ -893,6 +1040,8 @@ proc parseOpts(args: seq[string], isListCmd: bool = false): ParsedOpts =
           if isListCmd: opts.showAll = true
           else: expectVal = "a-alarm"
         of "alarm": expectVal = "a-alarm"
+        of "every": expectVal = "every"
+        of "on": expectVal = "on"
         of "c", "cal", "calendar": expectVal = "c"
         of "s", "sort": expectVal = "s"
         of "all": opts.showAll = true
@@ -932,6 +1081,7 @@ proc cmdAdd(args: seq[string]) =
     categories: opts.tags,
     attachments: opts.attachments,
     alarms: opts.alarms,
+    rrule: if opts.hasEvery: parseEveryInput(opts.every, opts.onDays) else: none(RecurRule),
     calendarName: calName,
     filePath: filePath,
     created: some(now().utc),
@@ -983,6 +1133,8 @@ proc cmdEdit(args: seq[string]) =
       for att in opts.attachments:
         task.attachments.add(att)
   if opts.hasAlarms: task.alarms = opts.alarms
+  if opts.hasEvery:
+    task.rrule = parseEveryInput(opts.every, opts.onDays)
 
   # Update summary if positional arg given
   if opts.args.len > 0:
@@ -1082,10 +1234,14 @@ proc cmdList(args: seq[string]) =
 
 proc cmdDone(args: seq[string]) =
   if args.len == 0:
-    quit("Usage: td done <id> [id...]", 1)
+    quit("Usage: td done <id> [id...] [--all]", 1)
+
+  let opts = parseOpts(args)
+  if opts.args.len == 0:
+    quit("Usage: td done <id> [id...] [--all]", 1)
 
   var allTasks = loadAllTasks()
-  for arg in args:
+  for arg in opts.args:
     var taskId: int
     try: taskId = parseInt(arg)
     except ValueError:
@@ -1096,9 +1252,26 @@ proc cmdDone(args: seq[string]) =
       stderr.writeLine("Task not found: " & $taskId)
       continue
     var task = allTasks[idx]
-    task.status = tsCompleted
-    task.percentComplete = 100
-    task.completed = some(now().utc)
+
+    if task.rrule.isSome and not opts.showAll:
+      # Recurring task: advance to next occurrence
+      if task.due.isSome:
+        task.due = some(nextOccurrence(task.due.get, task.rrule.get))
+      else:
+        # No due date, use today as base and advance
+        let todayDue = DueDate(dt: now().local, isDateOnly: true)
+        task.due = some(nextOccurrence(todayDue, task.rrule.get))
+      task.status = tsNeedsAction
+      task.percentComplete = 0
+      task.completed = none(DateTime)
+    else:
+      # Non-recurring or --all: complete entirely
+      task.status = tsCompleted
+      task.percentComplete = 100
+      task.completed = some(now().utc)
+      if task.rrule.isSome:
+        task.rrule = none(RecurRule)
+
     task.sequence += 1
     task.lastModified = some(now().utc)
     writeFile(task.filePath, toIcs(task))
@@ -1217,6 +1390,8 @@ Add/Edit options:
   -f, --attach FILE     File attachment (repeatable, additive on edit)
   -F, --detach NAME     Remove attachment matching NAME (or "" for all)
   -a, --alarm MIN       Alarm N minutes before due (repeatable)
+  --every INTERVAL      Recurrence (1d, 2w, 1m, 1y, daily, weekly, monthly, yearly)
+  --on DAYS             Weekdays for weekly recurrence (mo,we,fr)
   -c, --calendar CAL    Calendar name
 
 List options:
@@ -1228,7 +1403,11 @@ List options:
   -s, --sort FIELD      Sort by: due/d, prio/p, created/c
   -D, --done            Show completed/cancelled tasks
 
+Done options:
+  --all                 Complete entire recurring series (default: advance to next)
+
 Edit: use empty string to clear a field (e.g., -d "" clears due date)
+Recurrence: --every "" clears recurrence on edit
 
 Global:
   -v, --version         Show version
