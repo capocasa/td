@@ -1,10 +1,8 @@
 # td
 
-Task manager for ICS files synced by vdirsyncer.
+Task manager for ICS files synced by vdirsyncer. A drop-in replacement for [todoman](https://github.com/pimutils/todoman) — fuller featured, no interactive prompts, just CLI flags. Works directly with your CalDAV-synced `.ics` files, no database.
 
-> Note: This tool is new but used by the author every day.
-
-A drop-in replacement for [todoman](https://github.com/pimutils/todoman). Fuller featured, no interactive prompts, just straightforward CLI flags. Works directly with your CalDAV-synced `.ics` files — no database, no lock-in.
+Note: new, but used by the author every day.
 
 ## Install
 
@@ -18,7 +16,7 @@ Requires [vdirsyncer](https://github.com/pimutils/vdirsyncer) (or any tool that 
 
 ```sh
 td                          # list actionable tasks
-td add "Buy milk"           # add a task
+td add "Buy milk"
 td add -d tomorrow -p high "Ship feature"
 td done 3                   # mark task 3 complete
 td 3                        # show details for task 3
@@ -26,22 +24,11 @@ td 3                        # show details for task 3
 
 ## Commands
 
-| Command | Aliases | Description |
-|---------|---------|-------------|
-| `list`  | `ls` | List tasks (default when you just type `td`) |
-| `add`   | `new` | Add a new task |
-| `edit`  | `mod`, `modify` | Edit an existing task |
-| `done`  | `do` | Mark task(s) as completed |
-| `cancel` | | Mark task(s) as cancelled |
-| `find`  | `search` | Full text search across all tasks |
-| `delete` | `del`, `rm`, `remove` | Delete task(s) (moves to trash) |
-| `show`  | `view` | Show full task details |
-
-A bare number is a shortcut for show: `td 7` is the same as `td show 7`.
+`list` (or just `td`) — list tasks. `add` / `edit` / `done` / `cancel` / `delete` / `show` / `find` do what you'd expect. Most have short aliases (`ls`, `new`, `mod`, `do`, `rm`, etc.). A bare number is shorthand for show: `td 7` = `td show 7`.
 
 ## Options
 
-**Add and edit:**
+Adding and editing:
 
 ```
 -d, --due DATE        today, tomorrow, monday, +3d, +1w, -2d, 2026-04-01
@@ -52,7 +39,7 @@ A bare number is a shortcut for show: `td 7` is the same as `td show 7`.
 -c, --calendar CAL    calendar name
 ```
 
-**List and filter:**
+Listing and filtering:
 
 ```
 -a, --all             show all tasks including completed
@@ -64,15 +51,7 @@ A bare number is a shortcut for show: `td 7` is the same as `td show 7`.
     --done            show completed/cancelled tasks
 ```
 
-## Defaults
-
-`td` with no arguments shows tasks that are:
-
-- Active (not completed or cancelled)
-- Due today, overdue, or with no due date
-- Medium priority or higher (low-priority tasks are hidden)
-
-Use `-a` to see everything, or `--done` to see completed tasks.
+By default, `td` shows active tasks that are due today, overdue, or have no due date, at medium priority or higher. Use `-a` to see everything.
 
 ## Editing and Clearing Fields
 
@@ -83,7 +62,6 @@ td edit 3 -d tomorrow       # change due date
 td edit 3 "New summary"     # change summary
 td edit 3 -d ""             # clear due date
 td edit 3 -n ""             # clear notes
-td edit 3 -t ""             # clear all tags
 ```
 
 ## Configuration
@@ -95,18 +73,13 @@ TD_PATH=~/.local/var/lib/vdirsyncer/calendars
 TD_CALENDAR=default
 ```
 
-`TD_PATH` defaults to `~/.local/var/lib/vdirsyncer/calendars`. If you have multiple calendars, `TD_CALENDAR` sets which one gets new tasks. Without it, td auto-detects.
+`TD_PATH` defaults to `~/.local/var/lib/vdirsyncer/calendars`. `TD_CALENDAR` sets which calendar gets new tasks.
 
-## How It Works
+## Internals
 
-td reads and writes standard RFC 5545 VTODO entries in `.ics` files. It assigns stable short numeric IDs (stored in `~/.local/share/td/idmap`) so you don't have to deal with UUIDs. Deleted tasks are moved to a `.trash` folder under your calendar path rather than permanently removed.
+td reads and writes standard RFC 5545 VTODO entries in `.ics` files. Short numeric IDs are mapped in `~/.local/share/td/idmap` so you don't have to deal with UUIDs. Deleted tasks go to a `.trash` folder under your calendar path.
 
-The ICS parser is round-trip safe — it preserves timezone data, unknown properties, and anything else your CalDAV server or other clients put in the files.
-
-## Exit Codes
-
-- `0` — success (for `list` and `find`: results found)
-- `1` — error, or no results
+The ICS parser is round-trip safe — preserves timezone data, unknown properties, and anything else your CalDAV server puts in there.
 
 ## License
 

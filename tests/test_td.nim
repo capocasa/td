@@ -904,6 +904,21 @@ suite "date input parsing":
     let (output, _) = env.run("show", $id)
     check "2026-12-25" in output
 
+  test "absolute date non-zero-padded":
+    let id = env.addTask("Short date", "-d", "2026-4-4")
+    let (output, _) = env.run("show", $id)
+    check "2026-04-04" in output
+
+  test "absolute date with time":
+    let id = env.addTask("Meeting", "-d", "2026-12-25 13:00")
+    let (output, _) = env.run("show", $id)
+    check "Due:" in output
+
+  test "non-zero-padded date with time":
+    let id = env.addTask("Lunch", "-d", "2026-4-4 13:00")
+    let (output, _) = env.run("show", $id)
+    check "Due:" in output
+
 suite "priority input parsing":
   var env: TestEnv
 

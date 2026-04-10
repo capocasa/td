@@ -635,54 +635,111 @@ proc parseDateInput(s: string): DueDate =
     of "eod": return withTime(base, 17)
     else: quit("Invalid time word: " & word, 1)
 
+  proc parseClockTime(s: string): tuple[hour, minute: int, ok: bool] =
+    ## Parse clock times: 9:00, 14:30, 9am, 9pm, 9:30am, 2:30pm
+    var h, m: int
+    var rest = s.toLowerAscii.strip
+    var isPm = false
+    var isAm = false
+    if rest.endsWith("am"):
+      isAm = true
+      rest = rest[0 ..< rest.len - 2]
+    elif rest.endsWith("pm"):
+      isPm = true
+      rest = rest[0 ..< rest.len - 2]
+    if ':' in rest:
+      let parts = rest.split(':')
+      if parts.len != 2: return (0, 0, false)
+      try:
+        h = parseInt(parts[0])
+        m = parseInt(parts[1])
+      except ValueError: return (0, 0, false)
+    else:
+      try:
+        h = parseInt(rest)
+        m = 0
+      except ValueError: return (0, 0, false)
+    if isPm and h < 12: h += 12
+    elif isAm and h == 12: h = 0
+    if h < 0 or h > 23 or m < 0 or m > 59: return (0, 0, false)
+    return (h, m, true)
+
+  proc isClockTime(s: string): bool =
+    parseClockTime(s).ok
+
+  proc normalizeDate(s: string): string =
+    ## Normalize flexible date formats to YYYYMMDD
+    ## Handles: YYYY-MM-DD, YYYY-M-D, YYYYMMDD, YYYY-MM-D, YYYY-M-DD
+    if '-' in s:
+      let dateParts = s.split('-')
+      if dateParts.len == 3:
+        try:
+          let y = dateParts[0]
+          let m = align($parseInt(dateParts[1]), 2, '0')
+          let d = align($parseInt(dateParts[2]), 2, '0')
+          return y & m & d
+        except ValueError: discard
+    return s.replace("-", "")
+
+  proc tryParseAbsoluteDate(s: string): tuple[dt: DateTime, ok: bool] =
+    let cleaned = normalizeDate(s)
+    try:
+      return (parse(cleaned, "yyyyMMdd"), true)
+    except:
+      return (dateTime(2000, mJan, 1), false)
+
+  const TimeWords = ["morning", "noon", "afternoon", "evening", "tonight", "midnight", "eod"]
+
+  proc resolveDay(s: string): tuple[dt: DateTime, ok: bool] =
+    ## Resolve a day expression to a DateTime. Handles named days, weekdays, and absolute dates.
+    case s
+    of "today": return (todayDate, true)
+    of "tomorrow": return (todayDate + 1.days, true)
+    of "yesterday": return (todayDate - 1.days, true)
+    of "monday", "mon": return (nextWeekday(dMon).dt, true)
+    of "tuesday", "tue": return (nextWeekday(dTue).dt, true)
+    of "wednesday", "wed": return (nextWeekday(dWed).dt, true)
+    of "thursday", "thu": return (nextWeekday(dThu).dt, true)
+    of "friday", "fri": return (nextWeekday(dFri).dt, true)
+    of "saturday", "sat": return (nextWeekday(dSat).dt, true)
+    of "sunday", "sun": return (nextWeekday(dSun).dt, true)
+    else: return tryParseAbsoluteDate(s)
+
   let lower = s.toLowerAscii.strip
   let parts = lower.split(' ', 1)
 
-  # Two-word forms: "tomorrow morning", "monday noon", etc.
+  # Two-word forms: "tomorrow morning", "monday 9am", "2026-4-4 13:00", etc.
   if parts.len == 2:
     let timeWord = parts[1].strip
-    if timeWord in ["morning", "noon", "afternoon", "evening", "tonight", "midnight", "eod"]:
-      let dayPart = parts[0].strip
-      var base: DateTime
-      case dayPart
-      of "today": base = todayDate
-      of "tomorrow": base = todayDate + 1.days
-      of "yesterday": base = todayDate - 1.days
-      of "monday", "mon": base = nextWeekday(dMon).dt
-      of "tuesday", "tue": base = nextWeekday(dTue).dt
-      of "wednesday", "wed": base = nextWeekday(dWed).dt
-      of "thursday", "thu": base = nextWeekday(dThu).dt
-      of "friday", "fri": base = nextWeekday(dFri).dt
-      of "saturday", "sat": base = nextWeekday(dSat).dt
-      of "sunday", "sun": base = nextWeekday(dSun).dt
-      else: quit("Invalid date: " & s, 1)
+    let dayPart = parts[0].strip
+    if timeWord in TimeWords or isClockTime(timeWord):
+      let (base, ok) = resolveDay(dayPart)
+      if not ok: quit("Invalid date: " & s, 1)
+      if isClockTime(timeWord):
+        let (h, m, _) = parseClockTime(timeWord)
+        return withTime(base, h, m)
       return resolveTimeWord(timeWord, base)
 
-  case lower
-  of "today": return DueDate(dt: todayDate, isDateOnly: true)
-  of "tomorrow": return DueDate(dt: todayDate + 1.days, isDateOnly: true)
-  of "yesterday": return DueDate(dt: todayDate - 1.days, isDateOnly: true)
-  of "monday", "mon": return nextWeekday(dMon)
-  of "tuesday", "tue": return nextWeekday(dTue)
-  of "wednesday", "wed": return nextWeekday(dWed)
-  of "thursday", "thu": return nextWeekday(dThu)
-  of "friday", "fri": return nextWeekday(dFri)
-  of "saturday", "sat": return nextWeekday(dSat)
-  of "sunday", "sun": return nextWeekday(dSun)
-  of "morning": return resolveTimeWord("morning", todayDate)
-  of "noon": return resolveTimeWord("noon", todayDate)
-  of "afternoon": return resolveTimeWord("afternoon", todayDate)
-  of "evening": return resolveTimeWord("evening", todayDate)
-  of "tonight": return resolveTimeWord("tonight", todayDate)
-  of "midnight": return resolveTimeWord("midnight", todayDate)
-  of "eod": return resolveTimeWord("eod", todayDate)
-  else: discard
+  # Single-word day: today, tomorrow, monday, 2026-04-04, etc.
+  let (dayDt, dayOk) = resolveDay(lower)
+  if dayOk:
+    return DueDate(dt: dayDt, isDateOnly: true)
+
+  # Single-word time: morning, noon, etc. → today + time
+  if lower in TimeWords:
+    return resolveTimeWord(lower, todayDate)
+
+  # Bare clock time: 9:00, 9am, 14:30, 2:30pm → next occurrence
+  if isClockTime(lower):
+    let (h, m, _) = parseClockTime(lower)
+    let base = if today.hour < h or (today.hour == h and today.minute < m): todayDate
+               else: todayDate + 1.days
+    return withTime(base, h, m)
 
   # Relative: +3d, -1w, +2m, +1h, +30min, +90s
   if lower.len >= 2 and lower[0] in {'+', '-'}:
     let sign = if lower[0] == '+': 1 else: -1
     let tail = lower[1 .. ^1]
-    # Find where digits end
     var i = 0
     while i < tail.len and tail[i] in {'0'..'9'}: inc i
     if i > 0 and i < tail.len:
@@ -706,12 +763,7 @@ proc parseDateInput(s: string): DueDate =
         else: discard
       except ValueError: discard
 
-  # Absolute: 2026-04-01 or 20260401
-  let cleaned = lower.replace("-", "")
-  try:
-    return DueDate(dt: parse(cleaned, "yyyyMMdd"), isDateOnly: true)
-  except:
-    quit("Invalid date: " & s, 1)
+  quit("Invalid date: " & s, 1)
 
 proc parsePriority(s: string): int =
   case s.toLowerAscii
